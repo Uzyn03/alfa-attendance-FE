@@ -1,0 +1,1176 @@
+
+script service.py :
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from datetime import datetime, timedelta
+import joblib
+import os
+import logging
+from typing import List, Dict, Optional
+
+# Import model Pydantic yang baru
+from app.models.ml_models import PerformanceMetrics, RegressionRequest, RegressionResponse, RegressionModelStatus
+from app.core.config import settings
+from app.services.firebase_service import firebase_service # Tetap import untuk struktur
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MLService:
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.rf_model = None
+        self.regression_features = [
+            'average_daily_hours',
+            'attendance_rate',
+            'overtime_ratio',
+            'punctuality_score',
+            'consistency_score',
+            'productivity_score'
+        ]
+        self.model_metadata = {} # Untuk menyimpan metadata model
+
+    async def initialize(self):
+        """Initialize ML service and load saved models if available"""
+        try:
+            # Buat direktori models jika belum ada
+            os.makedirs(settings.ML_MODEL_PATH, exist_ok=True)
+
+            # Coba muat model yang sudah ada
+            scaler_path = os.path.join(settings.ML_MODEL_PATH, "scaler_rf.joblib")
+            rf_path = os.path.join(settings.ML_MODEL_PATH, "rf_model.joblib")
+
+            if os.path.exists(scaler_path) and os.path.exists(rf_path):
+                self.scaler = joblib.load(scaler_path)
+                self.rf_model = joblib.load(rf_path)
+                print("✅ Model Random Forest dan Scaler berhasil dimuat")
+                # Muat metadata jika ada
+                metadata_path = os.path.join(settings.ML_MODEL_PATH, "rf_metadata.joblib")
+                if os.path.exists(metadata_path):
+                    self.model_metadata = joblib.load(metadata_path)
+            else:
+                print("ℹ️ Tidak ada model Random Forest yang ditemukan. Akan melatih model baru.")
+                await self.train_model() # Latih model jika tidak ada
+
+        except Exception as e:
+            print(f"❌ Error menginisialisasi ML service: {e}")
+            # Jika ada error saat inisialisasi, coba latih model sebagai fallback
+            try:
+                await self.train_model()
+            except Exception as train_e:
+                print(f"❌ Gagal melatih model saat inisialisasi: {train_e}")
+                raise
+
+    async def _load_and_preprocess_csv_data(self, csv_url: str) -> pd.DataFrame:
+        """
+        Memuat data dari URL CSV dan melakukan preprocessing awal.
+        """
+        try:
+            df_raw = pd.read_csv(csv_url)
+            logger.info(f"CSV data loaded successfully from {csv_url}. Shape: {df_raw.shape}")
+
+            # Konversi kolom waktu ke format yang bisa diproses
+            # Pastikan format tanggal sesuai dengan CSV Anda (misal: 12/30/2024)
+            df_raw['Tanggal'] = pd.to_datetime(df_raw['Tanggal'], format='%m/%d/%Y')
+
+            # Konversi 'Jam Kerja' dan 'Jam Lembur' dari HH:MM:SS ke menit
+            def time_str_to_minutes(time_str):
+                if pd.isna(time_str) or not isinstance(time_str, str):
+                    return 0
+                parts = time_str.split(':')
+                if len(parts) == 3: # HH:MM:SS
+                    h, m, s = map(int, parts)
+                    return h * 60 + m + s / 60
+                elif len(parts) == 2: # HH:MM
+                    h, m = map(int, parts)
+                    return h * 60 + m
+                return 0
+
+            df_raw['workMinutes'] = df_raw['Jam Kerja'].apply(time_str_to_minutes)
+            df_raw['overtimeMinutes'] = df_raw['Jam Lembur'].apply(time_str_to_minutes)
+
+            return df_raw
+        except Exception as e:
+            logger.error(f"Error loading or preprocessing CSV data: {e}")
+            raise
+
+    async def _calculate_metrics_for_user_group(self, user_df: pd.DataFrame, total_possible_working_days: int) -> PerformanceMetrics:
+        """
+        Menghitung metrik kinerja untuk satu grup pengguna (satu karyawan) dari DataFrame.
+        """
+        if user_df.empty:
+            return PerformanceMetrics(
+                user_id="unknown", total_work_hours=0.0, average_daily_hours=0.0,
+                attendance_rate=0.0, overtime_ratio=0.0, punctuality_score=0.0,
+                consistency_score=0.0, productivity_score=0.0, performance_score=0.0
+            )
+
+        user_id = user_df['Nama'].iloc[0] # Gunakan Nama sebagai ID sementara untuk pelatihan
+
+        # Filter hanya data dengan status "Hadir"
+        attended_df = user_df[user_df['Status'] == 'Hadir'].copy()
+        
+        if attended_df.empty:
+            total_work_minutes = 0
+            total_overtime_minutes = 0
+            total_days_attended = 0
+        else:
+            total_work_minutes = attended_df['workMinutes'].sum()
+            total_overtime_minutes = attended_df['overtimeMinutes'].sum()
+            total_days_attended = len(attended_df)
+
+        total_work_hours = total_work_minutes / 60.0
+        average_daily_hours = total_work_hours / total_days_attended if total_days_attended > 0 else 0
+
+        # Hitung attendance rate berdasarkan hari kerja yang sebenarnya
+        # Hitung total hari dalam dataset untuk user ini (termasuk weekend)
+        user_date_range = user_df['Tanggal'].max() - user_df['Tanggal'].min()
+        user_total_days = user_date_range.days + 1
+        
+        # Estimasi hari kerja untuk user ini (asumsi 5/7 dari total hari)
+        user_working_days = max(1, int(user_total_days * 5/7))
+        attendance_rate = (total_days_attended / user_working_days) * 100
+        attendance_rate = min(attendance_rate, 100) # Batasi hingga 100%
+
+        overtime_ratio = (total_overtime_minutes / total_work_minutes) * 100 if total_work_minutes > 0 else 0
+
+        punctuality_score = self._calculate_punctuality_score(attended_df)
+        consistency_score = self._calculate_consistency_score(attended_df)
+        productivity_score = self._calculate_productivity_score(attended_df)
+
+        # Hitung skor kinerja keseluruhan dengan formula yang diperbaiki
+        metrics_dict = {
+            'total_work_hours': total_work_hours,
+            'average_daily_hours': average_daily_hours,
+            'attendance_rate': attendance_rate,
+            'overtime_ratio': overtime_ratio,
+            'punctuality_score': punctuality_score,
+            'consistency_score': consistency_score,
+            'productivity_score': productivity_score
+        }
+        overall_score = self._calculate_overall_performance_score(metrics_dict)
+
+        return PerformanceMetrics(
+            user_id=user_id,
+            total_work_hours=total_work_hours,
+            average_daily_hours=average_daily_hours,
+            attendance_rate=attendance_rate,
+            overtime_ratio=overtime_ratio,
+            punctuality_score=punctuality_score,
+            consistency_score=consistency_score,
+            productivity_score=productivity_score,
+            performance_score=overall_score
+        )
+
+    def _calculate_working_days(self, date_from_str: str, date_to_str: str) -> int:
+        """Menghitung jumlah hari kerja (Senin-Jumat) dalam rentang tanggal."""
+        try:
+            start = datetime.strptime(date_from_str, "%Y-%m-%d")
+            end = datetime.strptime(date_to_str, "%Y-%m-%d")
+
+            working_days = 0
+            current = start
+            while current <= end:
+                if current.weekday() < 5:  # Monday=0, Friday=4
+                    working_days += 1
+                current += timedelta(days=1)
+            return working_days
+        except Exception as e:
+            logger.warning(f"Error calculating working days: {e}. Defaulting to 22.")
+            return 22 # Default jika ada masalah
+
+    def _calculate_punctuality_score(self, df: pd.DataFrame) -> float:
+        """Menghitung skor ketepatan waktu berdasarkan jam masuk."""
+        try:
+            if df.empty:
+                return 0.0
+                
+            target_hour, target_minute = map(int, settings.PUNCTUALITY_TIME_THRESHOLD.split(':'))
+            target_minutes = target_hour * 60 + target_minute
+
+            punctual_days = 0
+            total_days = 0
+            
+            for _, row in df.iterrows():
+                jam_masuk_str = row['Jam Masuk']
+                if pd.notna(jam_masuk_str) and isinstance(jam_masuk_str, str):
+                    try:
+                        # Parse jam masuk (format: "7:54" atau "07:54")
+                        time_parts = jam_masuk_str.split(':')
+                        if len(time_parts) == 2:
+                            hour = int(time_parts[0])
+                            minute = int(time_parts[1])
+                            clock_in_minutes = hour * 60 + minute
+                            
+                            # Dianggap tepat waktu jika masuk sebelum atau tepat 08:15 (target + 15 menit)
+                            if clock_in_minutes <= target_minutes + 15:
+                                punctual_days += 1
+                            total_days += 1
+                    except (ValueError, IndexError):
+                        continue
+
+            return (punctual_days / total_days) * 100 if total_days > 0 else 0.0
+        except Exception as e:
+            logger.warning(f"Error calculating punctuality score: {e}. Defaulting to 50.0.")
+            return 50.0
+
+    def _calculate_consistency_score(self, df: pd.DataFrame) -> float:
+        """Menghitung skor konsistensi berdasarkan variasi jam kerja."""
+        try:
+            if df.empty:
+                return 0.0
+                
+            work_hours = df['workMinutes'] / 60.0
+            work_hours = work_hours[work_hours > 0]  # Filter jam kerja > 0
+            
+            if len(work_hours) < 2:
+                return 50.0  # Default untuk data terlalu sedikit
+
+            std_dev = work_hours.std()
+            mean_hours = work_hours.mean()
+
+            if mean_hours > 0:
+                coefficient_of_variation = std_dev / mean_hours
+                # Semakin rendah CV, semakin konsisten (skor tinggi)
+                consistency_score = max(0, 100 - (coefficient_of_variation * 100))
+            else:
+                consistency_score = 0
+
+            return min(consistency_score, 100)
+        except Exception as e:
+            logger.warning(f"Error calculating consistency score: {e}. Defaulting to 50.0.")
+            return 50.0
+
+    def _calculate_productivity_score(self, df: pd.DataFrame) -> float:
+        """Menghitung skor produktivitas berdasarkan deskripsi pekerjaan dan jam kerja."""
+        try:
+            if df.empty:
+                return 0.0
+                
+            total_score = 0
+            valid_days = 0
+            
+            for _, row in df.iterrows():
+                work_desc = str(row.get('Deskripsi Pekerjaan', ''))
+                work_hours = row.get('workMinutes', 0) / 60.0
+
+                if work_hours > 0:  # Hanya hitung hari dengan jam kerja > 0
+                    # Skor berdasarkan panjang deskripsi (maks 50 poin)
+                    # Deskripsi yang lebih panjang dan detail = produktivitas lebih tinggi
+                    desc_length = len(work_desc.strip())
+                    desc_score = min(desc_length / 20, 1) * 50  # 20 karakter = skor penuh
+                    
+                    # Skor berdasarkan jam kerja yang optimal (maks 50 poin)
+                    # Target 8 jam = skor penuh, kurang atau lebih dari itu dikurangi
+                    target_hours = settings.WORKING_HOURS_TARGET
+                    if work_hours <= target_hours:
+                        hours_score = (work_hours / target_hours) * 50
+                    else:
+                        # Penalti untuk jam kerja berlebihan
+                        excess_hours = work_hours - target_hours
+                        hours_score = max(0, 50 - (excess_hours * 5))  # Penalti 5 poin per jam lebih
+                    
+                    total_score += desc_score + hours_score
+                    valid_days += 1
+
+            return (total_score / valid_days) if valid_days > 0 else 0.0
+        except Exception as e:
+            logger.warning(f"Error calculating productivity score: {e}. Defaulting to 50.0.")
+            return 50.0
+
+    def _calculate_overall_performance_score(self, metrics: Dict[str, float]) -> float:
+        """
+        PERBAIKAN UTAMA: Menghitung skor kinerja keseluruhan yang lebih realistis.
+        """
+        # Weights yang lebih balanced dan realistis
+        weights = {
+            'attendance_rate': 0.30,      # Kehadiran paling penting
+            'productivity_score': 0.25,   # Produktivitas sangat penting
+            'punctuality_score': 0.20,    # Ketepatan waktu penting
+            'average_daily_hours': 0.15,  # Jam kerja cukup penting
+            'consistency_score': 0.10,    # Konsistensi penting tapi tidak dominan
+            'overtime_ratio': -0.05       # Lembur berlebihan adalah penalti
+        }
+
+        # Ambil nilai metrik
+        attendance_rate = metrics.get('attendance_rate', 0.0)
+        productivity_score = metrics.get('productivity_score', 0.0)
+        punctuality_score = metrics.get('punctuality_score', 0.0)
+        average_daily_hours = metrics.get('average_daily_hours', 0.0)
+        consistency_score = metrics.get('consistency_score', 0.0)
+        overtime_ratio = metrics.get('overtime_ratio', 0.0)
+
+        # BUSINESS LOGIC CONSTRAINTS - Penalti berat untuk performa sangat buruk
+        
+        # Jika attendance rate sangat rendah, skor maksimal dibatasi
+        if attendance_rate < 50:
+            max_possible_score = 40.0  # Maksimal 40 jika attendance < 50%
+        elif attendance_rate < 70:
+            max_possible_score = 60.0  # Maksimal 60 jika attendance < 70%
+        else:
+            max_possible_score = 100.0
+
+        # Jika productivity score sangat rendah, penalti tambahan
+        if productivity_score < 20:
+            max_possible_score = min(max_possible_score, 30.0)
+
+        # Normalisasi nilai ke skala 0-100
+        normalized_attendance = min(max(attendance_rate, 0), 100)
+        normalized_productivity = min(max(productivity_score, 0), 100)
+        normalized_punctuality = min(max(punctuality_score, 0), 100)
+        normalized_consistency = min(max(consistency_score, 0), 100)
+
+        # Normalisasi jam kerja harian (target 8 jam = 100 poin)
+        if average_daily_hours <= 8:
+            normalized_hours = (average_daily_hours / 8) * 100
+        else:
+            # Penalti untuk jam kerja berlebihan
+            normalized_hours = max(0, 100 - ((average_daily_hours - 8) * 10))
+
+        # Penalti overtime (semakin tinggi overtime ratio, semakin rendah skor)
+        overtime_penalty = min(overtime_ratio * 2, 20)  # Maksimal penalti 20 poin
+
+        # Hitung weighted score
+        total_weighted_score = (
+            normalized_attendance * weights['attendance_rate'] +
+            normalized_productivity * weights['productivity_score'] +
+            normalized_punctuality * weights['punctuality_score'] +
+            normalized_hours * weights['average_daily_hours'] +
+            normalized_consistency * weights['consistency_score']
+        ) * 100  # Konversi ke skala 0-100
+
+        # Kurangi penalti overtime
+        total_weighted_score -= overtime_penalty
+
+        # Terapkan business constraints
+        final_score = min(total_weighted_score, max_possible_score)
+        
+        # Pastikan skor tidak negatif
+        final_score = max(0.0, final_score)
+
+        return final_score
+
+    def _validate_data_quality(self, df: pd.DataFrame):
+        """Validasi dan perbaikan kualitas data"""
+        logger.info("🔍 Validating and fixing data quality...")
+        
+        # Perbaiki nilai yang tidak realistis
+        issues_fixed = 0
+        
+        for idx, row in df.iterrows():
+            # Jika attendance rate sangat rendah tapi performance score tinggi
+            if row['attendance_rate'] < 30 and row['performance_score'] > 50:
+                # Turunkan performance score
+                new_score = min(row['performance_score'], 25 + row['attendance_rate'] * 0.5)
+                df.at[idx, 'performance_score'] = new_score
+                issues_fixed += 1
+            
+            # Jika productivity score sangat rendah tapi performance score tinggi
+            if row['productivity_score'] < 20 and row['performance_score'] > 40:
+                new_score = min(row['performance_score'], 20 + row['productivity_score'])
+                df.at[idx, 'performance_score'] = new_score
+                issues_fixed += 1
+        
+        if issues_fixed > 0:
+            logger.info(f"✅ Fixed {issues_fixed} data quality issues")
+        
+        return df
+
+    async def train_model(self):
+        """PERBAIKAN: Melatih model dengan validasi dan preprocessing yang lebih baik."""
+        logger.info("🔄 Memulai pelatihan model Random Forest dengan validasi...")
+
+        try:
+            # Muat dan preprocess data CSV
+            df_raw = await self._load_and_preprocess_csv_data(settings.CSV_DATA_URL)
+            
+            if df_raw.empty:
+                raise ValueError("Dataset CSV kosong atau gagal diproses.")
+
+            # Dapatkan rentang tanggal keseluruhan dari dataset untuk perhitungan hari kerja
+            min_date_str = df_raw['Tanggal'].min().strftime('%Y-%m-%d')
+            max_date_str = df_raw['Tanggal'].max().strftime('%Y-%m-%d')
+            total_possible_working_days = self._calculate_working_days(min_date_str, max_date_str)
+
+            # Agregasi data per karyawan dan hitung metrik kinerja
+            performance_data_list = []
+            for user_name, user_df in df_raw.groupby('Nama'):
+                metrics = await self._calculate_metrics_for_user_group(user_df, total_possible_working_days)
+                performance_data_list.append(metrics)
+
+            if len(performance_data_list) < 10:
+                raise ValueError(f"Dataset terlalu kecil: {len(performance_data_list)} samples. Minimum 10 samples.")
+
+            df_metrics = pd.DataFrame([p.dict() for p in performance_data_list])
+            
+            # Validasi dan perbaiki kualitas data
+            df_metrics = self._validate_data_quality(df_metrics)
+
+            # Definisikan fitur (X) dan target (y)
+            X = df_metrics[self.regression_features].fillna(0)
+            y = df_metrics['performance_score'].fillna(0)
+
+            if X.empty or y.empty:
+                raise ValueError("Data yang diproses tidak cukup untuk melatih model regresi.")
+
+            # PERBAIKAN: Train/test split untuk validasi
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, shuffle=True
+            )
+
+            # Skala fitur
+            self.scaler = StandardScaler()
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+
+            # PERBAIKAN: Hyperparameter yang lebih baik
+            self.rf_model = RandomForestRegressor(
+                n_estimators=200,           # Lebih banyak trees untuk stabilitas
+                max_depth=8,                # Batasi depth untuk mencegah overfitting
+                min_samples_split=5,        # Minimal samples untuk split
+                min_samples_leaf=3,         # Minimal samples per leaf
+                max_features='sqrt',        # Feature selection per tree
+                bootstrap=True,
+                random_state=42,
+                n_jobs=-1
+            )
+
+            # Latih model
+            self.rf_model.fit(X_train_scaled, y_train)
+
+            # Evaluasi pada training dan test set
+            y_train_pred = self.rf_model.predict(X_train_scaled)
+            y_test_pred = self.rf_model.predict(X_test_scaled)
+            
+            train_mse = mean_squared_error(y_train, y_train_pred)
+            test_mse = mean_squared_error(y_test, y_test_pred)
+            train_r2 = r2_score(y_train, y_train_pred)
+            test_r2 = r2_score(y_test, y_test_pred)
+
+            # Check overfitting
+            overfitting_ratio = train_mse / test_mse if test_mse > 0 else float('inf')
+
+            # Simpan metadata
+            self.model_metadata = {
+                'rf_last_trained': datetime.now().isoformat(),
+                'rf_training_data_size': len(df_metrics),
+                'rf_train_mse': float(train_mse),
+                'rf_test_mse': float(test_mse),
+                'rf_train_r2': float(train_r2),
+                'rf_test_r2': float(test_r2),
+                'rf_overfitting_ratio': float(overfitting_ratio),
+                'rf_features': self.regression_features
+            }
+
+            # Feature importance
+            feature_importance = dict(zip(
+                self.regression_features, 
+                self.rf_model.feature_importances_
+            ))
+            self.model_metadata['feature_importance'] = feature_importance
+
+            self.save_models()
+            
+            logger.info(f"✅ Model berhasil dilatih!")
+            logger.info(f"   Train R²: {train_r2:.4f}, Test R²: {test_r2:.4f}")
+            logger.info(f"   Train MSE: {train_mse:.4f}, Test MSE: {test_mse:.4f}")
+            logger.info(f"   Overfitting ratio: {overfitting_ratio:.4f} ({'OK' if overfitting_ratio < 2.0 else 'WARNING'})")
+            
+            return {
+                "message": "Model Random Forest berhasil dilatih dengan validasi",
+                "train_r2": train_r2,
+                "test_r2": test_r2,
+                "train_mse": train_mse,
+                "test_mse": test_mse,
+                "overfitting_check": "OK" if overfitting_ratio < 2.0 else "Possible Overfitting"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error during training: {e}")
+            raise
+
+    def save_models(self):
+        """Menyimpan model yang sudah dilatih ke disk."""
+        try:
+            scaler_path = os.path.join(settings.ML_MODEL_PATH, "scaler_rf.joblib")
+            rf_path = os.path.join(settings.ML_MODEL_PATH, "rf_model.joblib")
+            metadata_path = os.path.join(settings.ML_MODEL_PATH, "rf_metadata.joblib")
+
+            joblib.dump(self.scaler, scaler_path)
+            joblib.dump(self.rf_model, rf_path)
+            joblib.dump(self.model_metadata, metadata_path)
+            print("✅ Model Random Forest, Scaler, dan Metadata berhasil disimpan.")
+        except Exception as e:
+            print(f"❌ Error menyimpan model: {e}")
+
+    def _validate_prediction_input(self, features: RegressionRequest):
+        """Validasi input features untuk prediksi"""
+        if features.attendance_rate < 0 or features.attendance_rate > 100:
+            raise ValueError("attendance_rate harus antara 0-100")
+        
+        if features.punctuality_score < 0 or features.punctuality_score > 100:
+            raise ValueError("punctuality_score harus antara 0-100")
+        
+        if features.consistency_score < 0 or features.consistency_score > 100:
+            raise ValueError("consistency_score harus antara 0-100")
+            
+        if features.productivity_score < 0 or features.productivity_score > 100:
+            raise ValueError("productivity_score harus antara 0-100")
+        
+        if features.average_daily_hours < 0 or features.average_daily_hours > 24:
+            raise ValueError("average_daily_hours harus antara 0-24")
+
+    def _apply_business_logic_constraints(self, features: RegressionRequest, prediction: float) -> float:
+        """
+        PERBAIKAN UTAMA: Terapkan business logic constraints pada hasil prediksi
+        """
+        
+        # Constraint 1: Jika attendance rate sangat rendah, skor tidak boleh tinggi
+        if features.attendance_rate < 10:
+            prediction = min(prediction, 15.0)  # Maksimal 15 jika attendance < 10%
+        elif features.attendance_rate < 30:
+            prediction = min(prediction, 35.0)  # Maksimal 35 jika attendance < 30%
+        elif features.attendance_rate < 50:
+            prediction = min(prediction, 50.0)  # Maksimal 50 jika attendance < 50%
+        
+        # Constraint 2: Jika productivity score sangat rendah, skor harus rendah
+        if features.productivity_score < 10:
+            prediction = min(prediction, 20.0)
+        elif features.productivity_score < 20:
+            prediction = min(prediction, 35.0)
+        
+        # Constraint 3: Jika punctuality score sangat rendah, penalti
+        if features.punctuality_score < 10:
+            prediction = min(prediction, 25.0)
+        
+        # Constraint 4: Kombinasi metrik rendah = skor sangat rendah
+        low_metrics_count = sum([
+            features.attendance_rate < 30,
+            features.punctuality_score < 30,
+            features.productivity_score < 30,
+            features.average_daily_hours < 4
+        ])
+        
+        if low_metrics_count >= 3:  # 3 atau lebih metrik rendah
+            prediction = min(prediction, 20.0)
+        elif low_metrics_count >= 2:  # 2 metrik rendah
+            prediction = min(prediction, 40.0)
+        
+        # Constraint 5: Jika semua metrik sangat rendah
+        if (features.attendance_rate < 20 and 
+            features.productivity_score < 20 and 
+            features.punctuality_score < 20):
+            prediction = min(prediction, 10.0)
+        
+        # Pastikan skor dalam range 0-100
+        return max(0.0, min(100.0, prediction))
+
+    async def predict_performance_score(self, features: RegressionRequest) -> float:
+        """PERBAIKAN: Prediksi dengan validasi input dan business logic constraints."""
+        if not self.rf_model or not self.scaler:
+            raise ValueError("Model Random Forest atau scaler belum dilatih. Jalankan pelatihan terlebih dahulu.")
+
+        # Validasi input
+        self._validate_prediction_input(features)
+
+        # Konversi fitur input ke array numpy
+        input_data = np.array([[
+            features.average_daily_hours,
+            features.attendance_rate,
+            features.overtime_ratio,
+            features.punctuality_score,
+            features.consistency_score,
+            features.productivity_score
+        ]])
+
+        # Skala fitur input
+        scaled_input = self.scaler.transform(input_data)
+
+        # Prediksi dari model
+        raw_prediction = self.rf_model.predict(scaled_input)[0]
+        
+        # Terapkan business logic constraints
+        final_prediction = self._apply_business_logic_constraints(features, raw_prediction)
+        
+        logger.info(f"Raw prediction: {raw_prediction:.2f}, Final prediction: {final_prediction:.2f}")
+        
+        return float(final_prediction)
+
+    async def test_model_behavior(self):
+        """Test model behavior dengan berbagai skenario"""
+        test_cases = [
+            {
+                "name": "Semua metrik sangat rendah",
+                "input": RegressionRequest(
+                    average_daily_hours=2.0,
+                    attendance_rate=5.0,
+                    overtime_ratio=0.0,
+                    punctuality_score=5.0,
+                    consistency_score=20.0,
+                    productivity_score=5.0
+                ),
+                "expected_range": (0, 15)
+            },
+            {
+                "name": "Input dari API test Anda",
+                "input": RegressionRequest(
+                    average_daily_hours=5.0,
+                    attendance_rate=0.0,
+                    overtime_ratio=0.0,
+                    punctuality_score=0.0,
+                    consistency_score=50.0,
+                    productivity_score=5.0
+                ),
+                "expected_range": (0, 15)
+            },
+            {
+                "name": "Metrik sedang",
+                "input": RegressionRequest(
+                    average_daily_hours=6.0,
+                    attendance_rate=60.0,
+                    overtime_ratio=5.0,
+                    punctuality_score=60.0,
+                    consistency_score=50.0,
+                    productivity_score=60.0
+                ),
+                "expected_range": (50, 70)
+            },
+            {
+                "name": "Metrik tinggi",
+                "input": RegressionRequest(
+                    average_daily_hours=8.0,
+                    attendance_rate=95.0,
+                    overtime_ratio=10.0,
+                    punctuality_score=90.0,
+                    consistency_score=85.0,
+                    productivity_score=90.0
+                ),
+                "expected_range": (80, 95)
+            }
+        ]
+        
+        results = []
+        for test_case in test_cases:
+            try:
+                score = await self.predict_performance_score(test_case["input"])
+                category = self.categorize_score(score)
+                
+                # Check if result is in expected range
+                min_expected, max_expected = test_case["expected_range"]
+                is_valid = min_expected <= score <= max_expected
+                
+                results.append({
+                    "test_name": test_case["name"],
+                    "input": test_case["input"].dict(),
+                    "predicted_score": score,
+                    "category": category,
+                    "expected_range": test_case["expected_range"],
+                    "is_valid": is_valid,
+                    "status": "✅ PASS" if is_valid else "❌ FAIL"
+                })
+            except Exception as e:
+                results.append({
+                    "test_name": test_case["name"],
+                    "error": str(e),
+                    "status": "❌ ERROR"
+                })
+        
+        return results
+
+    def categorize_score(self, score: float) -> str:
+        """Mengategorikan skor kinerja."""
+        if score < 60:
+            return "Kurang"
+        elif 60 <= score <= 80:
+            return "Cukup"
+        else: # score > 80
+            return "Baik"
+
+# Global instance
+ml_service = MLService()
+
+script ml_models_api.py :
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from typing import List, Optional, Dict
+import asyncio
+import logging
+
+# Hanya import model yang relevan untuk Random Forest Regression
+from app.models.ml_models import RegressionRequest, RegressionResponse, RegressionModelStatus
+from app.services.ml_service import ml_service
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# --- Endpoint Random Forest Regression ---
+@router.post("/regression/predict", response_model=RegressionResponse)
+async def predict_employee_performance(request: RegressionRequest):
+    """
+    Memprediksi skor kinerja karyawan berdasarkan metrik yang diberikan.
+    """
+    try:
+        predicted_score = await ml_service.predict_performance_score(request)
+        category = ml_service.categorize_score(predicted_score)
+        return RegressionResponse(
+            predicted_score=predicted_score,
+            category=category,
+            message=f"Prediksi skor kinerja: {predicted_score:.2f} ({category})"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error saat prediksi regresi: {e}")
+        raise HTTPException(status_code=500, detail=f"Error saat prediksi regresi: {str(e)}")
+
+@router.get("/regression/test")
+async def test_model_behavior():
+    """
+    Test behavior model dengan berbagai skenario input.
+    """
+    try:
+        results = await ml_service.test_model_behavior()
+        return {
+            "message": "Model behavior test completed",
+            "test_results": results,
+            "summary": {
+                "total_tests": len(results),
+                "passed": len([r for r in results if r.get("is_valid", False)]),
+                "failed": len([r for r in results if not r.get("is_valid", True)])
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error testing model behavior: {e}")
+        raise HTTPException(status_code=500, detail=f"Error testing model behavior: {str(e)}")
+
+@router.post("/regression/train")
+async def train_regression_model():
+    """
+    Melatih ulang model Random Forest Regression.
+    """
+    try:
+        result = await ml_service.train_model()
+        return {
+            "message": result["message"],
+            "train_mse": result["train_mse"], # Menggunakan train_mse
+            "test_mse": result["test_mse"],   # Menggunakan test_mse
+            "train_r2": result["train_r2"],   # Menggunakan train_r2
+            "test_r2": result["test_r2"]      # Menggunakan test_r2
+        }
+    except Exception as e:
+        logger.error(f"Error saat melatih ulang model regresi: {e}")
+        raise HTTPException(status_code=500, detail=f"Error saat melatih ulang model regresi: {str(e)}")
+
+@router.get("/regression/model-status", response_model=RegressionModelStatus)
+async def get_regression_model_status():
+    """
+    Mendapatkan informasi detail tentang status model Random Forest Regression.
+    """
+    try:
+        return RegressionModelStatus(
+            model_trained=ml_service.rf_model is not None,
+            feature_names=ml_service.regression_features,
+            model_metadata=ml_service.model_metadata,
+            feature_importance_plot=ml_service.model_metadata.get('feature_importance_plot'),
+            actual_vs_predicted_plot=ml_service.model_metadata.get('actual_vs_predicted_plot'),
+            predicted_distribution_plot=ml_service.model_metadata.get('predicted_distribution_plot')
+        )
+    except Exception as e:
+        logger.error(f"Error mendapatkan status model regresi: {e}")
+        raise HTTPException(status_code=500, detail=f"Error mendapatkan status model regresi: {str(e)}")
+
+sekarang saya ingin membuat visualisasi nya , diagram apa saja yang cocok untuk ditampilkan?
+
+ini frontend saya menggunakan nuxt3 dan shadcn/ui : 
+<script setup lang="ts">
+import { ref, onMounted } from "vue";
+import { Button } from "~/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "~/components/ui/card";
+import { Input } from "~/components/ui/input";
+import { Label } from "~/components/ui/label";
+import { Separator } from "~/components/ui/separator";
+
+// Interface untuk respons prediksi regresi
+interface RegressionPrediction {
+  predicted_score: number;
+  category: string;
+  message: string;
+}
+
+// Interface untuk status model regresi (termasuk plot Base64)
+interface RegressionModelStatus {
+  model_trained: boolean;
+  feature_names: string[];
+  model_metadata: { [key: string]: any }; // Menggunakan 'any' untuk fleksibilitas metadata
+  feature_importance_plot?: string;
+  actual_vs_predicted_plot?: string;
+  predicted_distribution_plot?: string;
+}
+
+// State untuk Random Forest Regression
+const regressionFeatures = ref({
+  average_daily_hours: 0,
+  attendance_rate: 0,
+  overtime_ratio: 0,
+  punctuality_score: 0,
+  consistency_score: 0,
+  productivity_score: 0,
+});
+const loadingRegression = ref<boolean>(false);
+const errorRegression = ref<string | null>(null);
+const regressionPrediction = ref<RegressionPrediction | null>(null);
+
+// State untuk Status Model dan Visualisasi
+const loadingModelStatus = ref<boolean>(false);
+const errorModelStatus = ref<string | null>(null);
+const modelStatus = ref<RegressionModelStatus | null>(null);
+
+// Definisi rentang input untuk panduan
+const inputRanges: {
+  [key: string]: { min: number; max: number; label: string };
+} = {
+  average_daily_hours: {
+    min: 0,
+    max: 24,
+    label: "Rata-rata jam kerja harian (0-24 jam)",
+  },
+  attendance_rate: { min: 0, max: 100, label: "Tingkat kehadiran (0-100%)" },
+  overtime_ratio: { min: 0, max: 100, label: "Rasio jam lembur (0-100%)" },
+  punctuality_score: {
+    min: 0,
+    max: 100,
+    label: "Skor ketepatan waktu (0-100)",
+  },
+  consistency_score: { min: 0, max: 100, label: "Skor konsistensi (0-100)" },
+  productivity_score: { min: 0, max: 100, label: "Skor produktivitas (0-100)" },
+};
+
+const handlePredictRegression = async () => {
+  loadingRegression.value = true;
+  errorRegression.value = null;
+  regressionPrediction.value = null;
+
+  try {
+    const response = await fetch(
+      "http://localhost:8000/api/v1/ml/regression/predict",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(regressionFeatures.value),
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || "Gagal melakukan prediksi regresi");
+    }
+
+    const data: RegressionPrediction = await response.json();
+    regressionPrediction.value = data;
+  } catch (err: any) {
+    errorRegression.value =
+      err.message || "Terjadi kesalahan tak terduga saat prediksi regresi.";
+    console.error("Regression prediction error:", err);
+  } finally {
+    loadingRegression.value = false;
+  }
+};
+
+const handleFeatureChange = (e: Event) => {
+  const target = e.target as HTMLInputElement;
+  const { id, value } = target;
+  regressionFeatures.value = {
+    ...regressionFeatures.value,
+    [id]: Number.parseFloat(value),
+  };
+};
+
+const fetchModelStatus = async () => {
+  loadingModelStatus.value = true;
+  errorModelStatus.value = null;
+  modelStatus.value = null;
+
+  try {
+    const response = await fetch(
+      "http://localhost:8000/api/v1/ml/regression/model-status"
+    );
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || "Gagal mengambil status model");
+    }
+    const data: RegressionModelStatus = await response.json();
+    modelStatus.value = data;
+  } catch (err: any) {
+    errorModelStatus.value =
+      err.message || "Terjadi kesalahan saat mengambil status model.";
+    console.error("Model status error:", err);
+  } finally {
+    loadingModelStatus.value = false;
+  }
+};
+
+const handleRetrainModel = async () => {
+  loadingModelStatus.value = true; // Gunakan loading yang sama atau buat terpisah
+  errorModelStatus.value = null;
+
+  try {
+    const response = await fetch(
+      "http://localhost:8000/api/v1/ml/regression/train",
+      {
+        method: "POST",
+      }
+    );
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || "Gagal melatih ulang model");
+    }
+    alert("Model berhasil dilatih ulang! Memuat status model terbaru...");
+    await fetchModelStatus(); // Muat status model dan visualisasi terbaru
+  } catch (err: any) {
+    errorModelStatus.value =
+      err.message || "Terjadi kesalahan saat melatih ulang model.";
+    console.error("Retrain model error:", err);
+  } finally {
+    loadingModelStatus.value = false;
+  }
+};
+
+// Fetch model status on component mount
+onMounted(() => {
+  fetchModelStatus();
+});
+</script>
+
+<template>
+  <div class="container mx-auto py-8 px-4 md:px-6">
+    <h1 class="text-3xl font-bold text-center mb-8">
+      Analisis Model Pembelajaran Mesin
+    </h1>
+
+    <!-- Bagian Random Forest Regression -->
+    <Card class="w-full max-w-4xl mx-auto mb-8">
+      <CardHeader>
+        <CardTitle>Prediksi Random Forest Regression</CardTitle>
+        <CardDescription>
+          Prediksi skor kinerja karyawan berdasarkan metrik yang diberikan
+          menggunakan model Random Forest Regression.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div
+            class="space-y-2"
+            v-for="(value, key) in regressionFeatures"
+            :key="key"
+          >
+            <Label :for="key">
+              {{
+                inputRanges[key as keyof typeof inputRanges]?.label ||
+                key.replace(/_/g, " ")
+              }}
+            </Label>
+            <Input
+              :id="key"
+              type="number"
+              step="0.1"
+              :min="inputRanges[key as keyof typeof inputRanges]?.min"
+              :max="inputRanges[key as keyof typeof inputRanges]?.max"
+              v-model="regressionFeatures[key as keyof typeof regressionFeatures]"
+              @input="handleFeatureChange"
+            />
+          </div>
+        </div>
+        <Button
+          @click="handlePredictRegression"
+          :disabled="loadingRegression"
+          class="w-full"
+        >
+          {{
+            loadingRegression
+              ? "Melakukan Prediksi..."
+              : "Prediksi Skor Kinerja"
+          }}
+        </Button>
+
+        <p v-if="errorRegression" class="text-red-500 text-center">
+          {{ errorRegression }}
+        </p>
+
+        <div
+          v-if="regressionPrediction"
+          class="mt-6 p-4 bg-green-100 text-green-800 rounded-md text-center"
+        >
+          <h3 class="text-lg font-semibold">Hasil Prediksi:</h3>
+          <p class="text-2xl font-bold">
+            {{ regressionPrediction.predicted_score.toFixed(2) }} ({{
+              regressionPrediction.category
+            }})
+          </p>
+          <p class="text-sm text-green-700">
+            {{ regressionPrediction.message }}
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+
+    <!-- Bagian Status Model dan Visualisasi -->
+    <Card class="w-full max-w-4xl mx-auto">
+      <CardHeader>
+        <CardTitle>Status Model Regresi & Visualisasi</CardTitle>
+        <CardDescription>
+          Lihat detail model Random Forest Regression yang sedang digunakan dan
+          visualisasi pelatihannya.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-6">
+        <Button
+          @click="fetchModelStatus"
+          :disabled="loadingModelStatus"
+          class="w-full mb-4"
+        >
+          {{
+            loadingModelStatus
+              ? "Memuat Status..."
+              : "Muat Status Model & Visualisasi"
+          }}
+        </Button>
+        <Button
+          @click="handleRetrainModel"
+          :disabled="loadingModelStatus"
+          class="w-full mb-4 bg-blue-500 hover:bg-blue-600 text-white"
+        >
+          {{ loadingModelStatus ? "Melatih Ulang..." : "Latih Ulang Model" }}
+        </Button>
+
+        <p v-if="errorModelStatus" class="text-red-500 text-center">
+          {{ errorModelStatus }}
+        </p>
+
+        <div v-if="modelStatus && modelStatus.model_trained" class="space-y-6">
+          <Separator />
+          <h3 class="text-lg font-semibold">Detail Model</h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <p>
+                <strong>Model Dilatih:</strong>
+                {{ modelStatus.model_trained ? "Ya" : "Tidak" }}
+              </p>
+              <p>
+                <strong>Terakhir Dilatih:</strong>
+                {{
+                  modelStatus.model_metadata?.rf_last_trained
+                    ? new Date(
+                        modelStatus.model_metadata.rf_last_trained
+                      ).toLocaleString()
+                    : "N/A"
+                }}
+              </p>
+              <p>
+                <strong>Ukuran Data Pelatihan:</strong>
+                {{ modelStatus.model_metadata?.rf_training_data_size || "N/A" }}
+              </p>
+            </div>
+            <div>
+              <p>
+                <strong>Train R²:</strong>
+                {{
+                  modelStatus.model_metadata?.rf_train_r2?.toFixed(4) || "N/A"
+                }}
+              </p>
+              <p>
+                <strong>Test R²:</strong>
+                {{
+                  modelStatus.model_metadata?.rf_test_r2?.toFixed(4) || "N/A"
+                }}
+              </p>
+              <p>
+                <strong>Train MSE:</strong>
+                {{
+                  modelStatus.model_metadata?.rf_train_mse?.toFixed(4) || "N/A"
+                }}
+              </p>
+              <p>
+                <strong>Test MSE:</strong>
+                {{
+                  modelStatus.model_metadata?.rf_test_mse?.toFixed(4) || "N/A"
+                }}
+              </p>
+              <p>
+                <strong>Overfitting Check:</strong>
+                {{
+                  modelStatus.model_metadata?.rf_overfitting_ratio
+                    ? modelStatus.model_metadata.rf_overfitting_ratio < 2.0
+                      ? "OK"
+                      : "WARNING"
+                    : "N/A"
+                }}
+              </p>
+            </div>
+          </div>
+
+          <Separator />
+          <h3 class="text-lg font-semibold">Visualisasi Model</h3>
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div
+              v-if="modelStatus.feature_importance_plot"
+              class="flex flex-col items-center"
+            >
+              <h4 class="font-medium mb-2">Feature Importance</h4>
+              <img
+                :src="modelStatus.feature_importance_plot"
+                alt="Feature Importance Plot"
+                class="w-full h-auto rounded-md border"
+              />
+            </div>
+            <div
+              v-if="modelStatus.actual_vs_predicted_plot"
+              class="flex flex-col items-center"
+            >
+              <h4 class="font-medium mb-2">Actual vs. Predicted Scores</h4>
+              <img
+                :src="modelStatus.actual_vs_predicted_plot"
+                alt="Actual vs Predicted Plot"
+                class="w-full h-auto rounded-md border"
+              />
+            </div>
+            <div
+              v-if="modelStatus.predicted_distribution_plot"
+              class="flex flex-col items-center lg:col-span-2"
+            >
+              <h4 class="font-medium mb-2">Predicted Score Distribution</h4>
+              <img
+                :src="modelStatus.predicted_distribution_plot"
+                alt="Predicted Score Distribution Plot"
+                class="w-full h-auto rounded-md border"
+              />
+            </div>
+            <p v-else class="text-center text-muted-foreground lg:col-span-2">
+              Tidak ada visualisasi yang tersedia. Pastikan model telah dilatih.
+            </p>
+          </div>
+        </div>
+        <div
+          v-else-if="!loadingModelStatus && !errorModelStatus"
+          class="text-center text-muted-foreground"
+        >
+          Model belum dilatih atau tidak ada data status. Klik "Muat Status
+          Model & Visualisasi" untuk memeriksa.
+        </div>
+      </CardContent>
+    </Card>
+  </div>
+</template>
+
+perbaiki saja jika ada yang harus diperbaiki
